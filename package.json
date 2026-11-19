@@ -1,0 +1,20 @@
+{
+  "name": "encrydb",
+  "version": "1.0.0",
+  "description": "Zero-knowledge encrypted messaging platform and voice chat for Vercel deployment.",
+  "main": "api/relay.js",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "keywords": [
+    "end-to-end-encryption",
+    "webrtc",
+    "zero-knowledge",
+    "messaging",
+    "discord-clone"
+  ],
+  "author": "LogicalArnesh",
+  "license": "MIT"
+}
