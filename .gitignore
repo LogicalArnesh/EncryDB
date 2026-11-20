@@ -5,3 +5,6 @@ dist/
 .env.*
 .dev.vars
 !.env.example
+
+# local screenshots
+art/
