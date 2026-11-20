@@ -85,9 +85,11 @@ export async function currentUser(
   return null
 }
 
-export function appOrigin(request: Request, env: Env): string | null {
-  if (env.APP_ORIGIN) return env.APP_ORIGIN
-  return isLocalPreview(request, env) ? new URL(request.url).origin : null
+export function appOrigin(request: Request, env: Env): string {
+  // Sites injects the canonical origin in production. Without it (local dev and
+  // the Cloud preview host) the request's own origin is the comparison point:
+  // a cross-site POST still carries a different Origin header and is refused.
+  return env.APP_ORIGIN || new URL(request.url).origin
 }
 
 /* ---------- password hashing (PBKDF2-SHA256, 150k rounds) ---------- */
