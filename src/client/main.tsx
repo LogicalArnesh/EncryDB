@@ -3,49 +3,104 @@ import { createRoot } from 'react-dom/client'
 import type {
   Channel,
   ChatMessage,
+  DmMessage,
+  Inbox,
   Peer,
   ServerSummary,
   SessionInfo,
+  User,
 } from '../shared/types'
 import { ApiError, api, formatDay, formatTime, initials, post, readAsDataUrl } from './api'
 import { VoiceSession } from './voice'
 import './style.css'
 
+type Me = User
+
 /* ------------------------------------------------------------------ auth ----- */
 
-function AuthScreen({ onDone }: { onDone: () => void }) {
-  const [mode, setMode] = useState<'signin' | 'signup'>('signin')
+function AuthScreen({ onDone, mailer }: { onDone: () => void; mailer: boolean }) {
+  const [step, setStep] = useState<'signin' | 'email' | 'code'>('signin')
+  const [identifier, setIdentifier] = useState('')
   const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
   const [name, setName] = useState('')
+  const [password, setPassword] = useState('')
+  const [code, setCode] = useState('')
+  const [devCode, setDevCode] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [info, setInfo] = useState('')
 
-  async function submit(event: React.FormEvent) {
+  async function signIn(event: React.FormEvent) {
     event.preventDefault()
     setError('')
-    if (!email.trim() || !password) {
-      setError('Email and password are required.')
-      return
-    }
-    if (mode === 'signup' && (!name.trim() || password.length < 8)) {
-      setError(
-        !name.trim()
-          ? 'Pick a display name.'
-          : 'Use at least 8 characters for your password.',
-      )
+    if (!identifier.trim() || !password) {
+      setError('Enter your user id and password.')
       return
     }
     setBusy(true)
     try {
-      await post(`/api/auth/${mode}`, {
-        email: email.trim().toLowerCase(),
-        password,
-        ...(mode === 'signup' ? { name: name.trim() } : {}),
-      })
+      await post('/api/auth/signin', { identifier: identifier.trim(), password })
       onDone()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not sign you in.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function requestCode(event: React.FormEvent) {
+    event.preventDefault()
+    setError('')
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim())) {
+      setError('Enter a valid email address.')
+      return
+    }
+    setBusy(true)
+    try {
+      const data = await post<{ delivery: string; code?: string }>(
+        '/api/auth/request-code',
+        { email: email.trim(), name: name.trim() },
+      )
+      setInfo(
+        data.delivery === 'email'
+          ? `We sent a six-digit code to ${email.trim()}.`
+          : 'Email delivery is not configured yet, so your code is shown below.',
+      )
+      setDevCode(data.code || '')
+      setStep('code')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not send the code.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function verify(event: React.FormEvent) {
+    event.preventDefault()
+    setError('')
+    if (!name.trim()) {
+      setError('Pick a display name.')
+      return
+    }
+    if (password.length < 8) {
+      setError('Use at least 8 characters for your password.')
+      return
+    }
+    if (!/^\d{6}$/.test(code.trim())) {
+      setError('Enter the six-digit code.')
+      return
+    }
+    setBusy(true)
+    try {
+      await post('/api/auth/verify', {
+        email: email.trim(),
+        code: code.trim(),
+        name: name.trim(),
+        password,
+      })
+      onDone()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not verify that code.')
     } finally {
       setBusy(false)
     }
@@ -55,70 +110,162 @@ function AuthScreen({ onDone }: { onDone: () => void }) {
     <div className="login-screen">
       <div className="login-card">
         <div className="logo">E</div>
-        <h1>{mode === 'signin' ? 'Welcome back' : 'Create your account'}</h1>
-        <p className="sub">
-          {mode === 'signin'
-            ? 'Sign in with the email you registered.'
-            : 'One account for every server, channel and call.'}
-        </p>
-        <form onSubmit={submit}>
-          {mode === 'signup' && (
-            <div className="field">
-              <label htmlFor="name">Display name</label>
-              <input
-                id="name"
-                value={name}
-                onChange={(event) => setName(event.target.value)}
-                autoComplete="name"
-                maxLength={60}
-                placeholder="Ada"
-              />
-            </div>
-          )}
-          <div className="field">
-            <label htmlFor="email">Email</label>
-            <input
-              id="email"
-              type="email"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              autoComplete="email"
-              placeholder="you@example.com"
-            />
-          </div>
-          <div className="field">
-            <label htmlFor="password">Password</label>
-            <input
-              id="password"
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              autoComplete={mode === 'signin' ? 'current-password' : 'new-password'}
-              placeholder={mode === 'signup' ? 'At least 8 characters' : 'Your password'}
-            />
-          </div>
-          {error && <div className="error">{error}</div>}
-          <button type="submit" disabled={busy}>
-            {busy
-              ? 'Please wait…'
-              : mode === 'signin'
-                ? 'Sign in'
-                : 'Create account'}
-          </button>
-        </form>
-        <div className="switch">
-          {mode === 'signin' ? (
-            <>
+        {step === 'signin' && (
+          <>
+            <h1>Welcome back</h1>
+            <p className="sub">Sign in with your EncryDB user id and password.</p>
+            <form onSubmit={signIn}>
+              <div className="field">
+                <label htmlFor="identifier">User id or email</label>
+                <input
+                  id="identifier"
+                  value={identifier}
+                  onChange={(event) => setIdentifier(event.target.value)}
+                  autoComplete="username"
+                  placeholder="EDB-7K4M-9QX2"
+                  autoCapitalize="characters"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="password">Password</label>
+                <input
+                  id="password"
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete="current-password"
+                  placeholder="Your password"
+                />
+              </div>
+              {error && <div className="error">{error}</div>}
+              <button type="submit" disabled={busy}>
+                {busy ? 'Signing in…' : 'Sign in'}
+              </button>
+            </form>
+            <div className="switch">
               New here?{' '}
-              <a onClick={() => setMode('signup')}>Create an account</a>
-            </>
-          ) : (
-            <>
-              Already registered?{' '}
-              <a onClick={() => setMode('signin')}>Sign in</a>
-            </>
-          )}
-        </div>
+              <a
+                onClick={() => {
+                  setStep('email')
+                  setError('')
+                  setInfo('')
+                }}
+              >
+                Create an account
+              </a>
+            </div>
+          </>
+        )}
+
+        {step === 'email' && (
+          <>
+            <h1>Create your id</h1>
+            <p className="sub">
+              Verify your email and we will generate your EncryDB user id.
+            </p>
+            <form onSubmit={requestCode}>
+              <div className="field">
+                <label htmlFor="email">Email</label>
+                <input
+                  id="email"
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  autoComplete="email"
+                  placeholder="you@example.com"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="name">Display name</label>
+                <input
+                  id="name"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  autoComplete="name"
+                  maxLength={60}
+                  placeholder="Ada"
+                />
+              </div>
+              {error && <div className="error">{error}</div>}
+              <button type="submit" disabled={busy}>
+                {busy ? 'Sending code…' : 'Send verification code'}
+              </button>
+            </form>
+            <div className="switch">
+              Already have an id?{' '}
+              <a
+                onClick={() => {
+                  setStep('signin')
+                  setError('')
+                }}
+              >
+                Sign in
+              </a>
+            </div>
+          </>
+        )}
+
+        {step === 'code' && (
+          <>
+            <h1>Verify your email</h1>
+            <p className="sub">{info || 'Enter the six-digit code we sent you.'}</p>
+            {devCode && (
+              <div className="code-hint">
+                Your code: <strong>{devCode}</strong>
+              </div>
+            )}
+            <form onSubmit={verify}>
+              <div className="field">
+                <label htmlFor="code">Verification code</label>
+                <input
+                  id="code"
+                  value={code}
+                  onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))}
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  placeholder="123456"
+                  className="code-input"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="vname">Display name</label>
+                <input
+                  id="vname"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  maxLength={60}
+                  placeholder="Ada"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="vpassword">Password</label>
+                <input
+                  id="vpassword"
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete="new-password"
+                  placeholder="At least 8 characters"
+                />
+              </div>
+              {error && <div className="error">{error}</div>}
+              <button type="submit" disabled={busy}>
+                {busy ? 'Creating id…' : 'Verify and create id'}
+              </button>
+            </form>
+            <div className="switch">
+              <a
+                onClick={() => {
+                  setStep('email')
+                  setError('')
+                }}
+              >
+                Use a different email
+              </a>
+              {!mailer && <span className="muted-note"> · mail delivery not set up</span>}
+            </div>
+          </>
+        )}
       </div>
     </div>
   )
@@ -177,7 +324,7 @@ function VoiceRoom({
   onMute: () => void
   onDeafen: () => void
   onLeave: () => void
-  meId: string | null
+  meId: string
 }) {
   return (
     <div className="voice-room">
@@ -237,13 +384,177 @@ function VoiceRoom({
   )
 }
 
+/* ---------------------------------------------------------------- inbox ----- */
+
+function InboxView({
+  messages,
+  onOpen,
+}: {
+  messages: DmMessage[]
+  onOpen: (message: DmMessage) => void
+}) {
+  return (
+    <div className="panel-page">
+      <div className="panel-page-head">
+        <div>
+          <h2>Direct messages</h2>
+          <p>Announcements from Server arrive here.</p>
+        </div>
+      </div>
+      <div className="dm-list">
+        {messages.length === 0 && (
+          <p className="empty">Nothing yet. You will be told here when a meeting starts.</p>
+        )}
+        {messages.map((message) => (
+          <div className="dm-item" key={message.id}>
+            <div className="avatar bot">S</div>
+            <div className="dm-body">
+              <div className="line">
+                <span className="author">Server</span>
+                <span className="bot-tag">bot</span>
+                <span className="time">{formatTime(message.createdAt)}</span>
+              </div>
+              <div className="text">{message.body}</div>
+              {message.channelId && (
+                <button className="dm-action" onClick={() => onOpen(message)}>
+                  Open channel
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/* ---------------------------------------------------------------- admin ----- */
+
+function AdminView({ me }: { me: Me }) {
+  const [users, setUsers] = useState<User[]>([])
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [created, setCreated] = useState<{ userId: string; password: string } | null>(null)
+
+  const load = useCallback(async () => {
+    try {
+      const data = await api<{ users: User[] }>('/api/admin/users')
+      setUsers(data.users)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not load accounts.')
+    }
+  }, [])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  async function create(event: React.FormEvent) {
+    event.preventDefault()
+    if (!name.trim()) return
+    setBusy(true)
+    setNotice('')
+    try {
+      const data = await post<{ user: User; password: string }>('/api/admin/users', {
+        name: name.trim(),
+        email: email.trim(),
+      })
+      setCreated({ userId: data.user.userId, password: data.password })
+      setName('')
+      setEmail('')
+      await load()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not create that id.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="panel-page">
+      <div className="panel-page-head">
+        <div>
+          <h2>Workspace admin</h2>
+          <p>You are signed in as {me.name}. Create ids for people on your team.</p>
+        </div>
+      </div>
+      <form className="admin-form" onSubmit={create}>
+        <div className="field">
+          <label htmlFor="new-name">Display name</label>
+          <input
+            id="new-name"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="Grace"
+            maxLength={60}
+          />
+        </div>
+        <div className="field">
+          <label htmlFor="new-email">Email (optional)</label>
+          <input
+            id="new-email"
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+            placeholder="grace@example.com"
+          />
+        </div>
+        <button type="submit" disabled={busy || !name.trim()}>
+          {busy ? 'Creating…' : 'Create id'}
+        </button>
+      </form>
+      {created && (
+        <div className="credentials">
+          <div>
+            <span>User id</span>
+            <strong>{created.userId}</strong>
+          </div>
+          <div>
+            <span>Temporary password</span>
+            <strong>{created.password}</strong>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              void navigator.clipboard?.writeText(
+                `EncryDB id: ${created.userId}\nPassword: ${created.password}`,
+              )
+              setNotice('Credentials copied.')
+            }}
+          >
+            Copy
+          </button>
+        </div>
+      )}
+      {notice && <div className="inline-note">{notice}</div>}
+      <div className="admin-list">
+        <div className="admin-row head">
+          <span>User id</span>
+          <span>Name</span>
+          <span>Role</span>
+        </div>
+        {users.map((user) => (
+          <div className="admin-row" key={user.id}>
+            <span className="mono">{user.userId}</span>
+            <span>{user.name}</span>
+            <span className={user.role === 'admin' ? 'role admin' : 'role'}>{user.role}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 /* --------------------------------------------------------------- main app --- */
 
+type View = 'chat' | 'inbox' | 'admin'
+
 function Workspace({
-  session,
+  me,
   onSignOut,
 }: {
-  session: SessionInfo & { user: { id: string; name: string; email: string } }
+  me: Me
   onSignOut: () => void
 }) {
   const [servers, setServers] = useState<ServerSummary[]>([])
@@ -255,6 +566,9 @@ function Workspace({
   const [sending, setSending] = useState(false)
   const [notice, setNotice] = useState('')
   const [loadingServers, setLoadingServers] = useState(true)
+  const [view, setView] = useState<View>('chat')
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [inbox, setInbox] = useState<Inbox>({ unread: 0, messages: [] })
 
   const [creatingServer, setCreatingServer] = useState(false)
   const [newServerName, setNewServerName] = useState('')
@@ -297,9 +611,27 @@ function Workspace({
     }
   }, [])
 
+  const loadInbox = useCallback(async () => {
+    try {
+      const data = await api<Inbox>('/api/dm')
+      setInbox(data)
+    } catch {
+      // The next poll retries.
+    }
+  }, [])
+
   useEffect(() => {
     void loadServers()
-  }, [loadServers])
+    void loadInbox()
+    const timer = window.setInterval(() => void loadInbox(), 15_000)
+    return () => window.clearInterval(timer)
+  }, [loadServers, loadInbox])
+
+  // Opening the inbox clears the unread badge.
+  useEffect(() => {
+    if (view !== 'inbox' || inbox.unread === 0) return
+    void post('/api/dm/read').then(() => setInbox((current) => ({ ...current, unread: 0 })))
+  }, [view, inbox.unread])
 
   // Keep a text channel selected inside the active server.
   useEffect(() => {
@@ -408,6 +740,7 @@ function Workspace({
       await loadServers()
       setActiveServerId(data.server.id)
       setActiveChannelId(data.server.channels[0]?.id ?? '')
+      setView('chat')
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not create that server.')
     }
@@ -423,6 +756,9 @@ function Workspace({
       setJoinCode('')
       await loadServers()
       setActiveServerId(data.serverId)
+      setView('chat')
+      setMenuOpen(false)
+      void loadInbox()
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not join that server.')
     }
@@ -463,6 +799,7 @@ function Workspace({
     voiceRef.current = session
     setVoiceChannelId(channel.id)
     setActiveChannelId(channel.id)
+    setView('chat')
     await session.start(channel.id, muted)
   }
 
@@ -485,193 +822,268 @@ function Workspace({
     voiceRef.current?.setDeafened(next)
   }
 
+  function selectChannel(channel: Channel) {
+    setActiveChannelId(channel.id)
+    setView('chat')
+    setMenuOpen(false)
+    if (channel.kind === 'voice' && voiceChannelId !== channel.id) void toggleVoice(channel)
+  }
+
+  function openInboxMessage(message: DmMessage) {
+    if (!message.serverId) return
+    const server = servers.find((item) => item.id === message.serverId)
+    setActiveServerId(message.serverId)
+    if (server && message.channelId) {
+      const channel = server.channels.find((item) => item.id === message.channelId)
+      setActiveChannelId(channel?.id ?? server.channels[0]?.id ?? '')
+    }
+    setView('chat')
+    setMenuOpen(false)
+  }
+
   const connectedVoice = voiceChannelId
     ? activeServer?.channels.find((channel) => channel.id === voiceChannelId) ?? null
     : null
 
   return (
-    <div className="app">
-      <div className="rail">
-        <div className="rail-logo" title="EncryDB">E</div>
-        {servers.map((server) => (
+    <div className={menuOpen ? 'app menu-open' : 'app'}>
+      <div className="side">
+        <div className="rail">
+          <div className="rail-logo" title="EncryDB">E</div>
+          {servers.map((server) => (
+            <button
+              key={server.id}
+              className={
+                view === 'chat' && server.id === activeServerId ? 'rail-item active' : 'rail-item'
+              }
+              title={server.name}
+              onClick={() => {
+                setActiveServerId(server.id)
+                setActiveChannelId(server.channels[0]?.id ?? '')
+                setView('chat')
+                setMenuOpen(false)
+              }}
+            >
+              {initials(server.name)}
+            </button>
+          ))}
           <button
-            key={server.id}
-            className={server.id === activeServerId ? 'rail-item active' : 'rail-item'}
-            title={server.name}
+            className="rail-item add"
+            title="Create a server"
             onClick={() => {
-              setActiveServerId(server.id)
-              setActiveChannelId(server.channels[0]?.id ?? '')
+              setCreatingServer((value) => !value)
+              setMenuOpen(true)
             }}
           >
-            {initials(server.name)}
+            +
           </button>
-        ))}
-        <button
-          className="rail-item add"
-          title="Create a server"
-          onClick={() => setCreatingServer((value) => !value)}
-        >
-          +
-        </button>
-      </div>
+          <div className="rail-spacer" />
+          <button
+            className={view === 'inbox' ? 'rail-item active' : 'rail-item'}
+            title="Direct messages"
+            onClick={() => {
+              setView('inbox')
+              setMenuOpen(false)
+            }}
+          >
+            ✉
+            {inbox.unread > 0 && <span className="badge">{inbox.unread}</span>}
+          </button>
+          {me.role === 'admin' && (
+            <button
+              className={view === 'admin' ? 'rail-item active' : 'rail-item'}
+              title="Admin"
+              onClick={() => {
+                setView('admin')
+                setMenuOpen(false)
+              }}
+            >
+              ⚙
+            </button>
+          )}
+        </div>
 
-      <div className="sidebar">
-        {creatingServer ? (
-          <form className="sidebar-form" onSubmit={createServer}>
-            <h2>New server</h2>
-            <input
-              autoFocus
-              value={newServerName}
-              onChange={(event) => setNewServerName(event.target.value)}
-              placeholder="Server name"
-              maxLength={60}
-            />
-            <div className="row">
-              <button type="submit">Create</button>
-              <button type="button" className="quiet" onClick={() => setCreatingServer(false)}>
-                Cancel
-              </button>
-            </div>
-            <form onSubmit={joinServer} className="join">
+        <div className="sidebar">
+          {creatingServer ? (
+            <form className="sidebar-form" onSubmit={createServer}>
+              <h2>New server</h2>
               <input
-                value={joinCode}
-                onChange={(event) => setJoinCode(event.target.value)}
-                placeholder="or paste an invite code"
-              />
-              <button type="submit" className="quiet">
-                Join
-              </button>
-            </form>
-          </form>
-        ) : activeServer ? (
-          <>
-            <div className="server-header">
-              <h2>{activeServer.name}</h2>
-              <button
-                className="quiet"
-                title="Invite code"
-                onClick={() => {
-                  void navigator.clipboard?.writeText(activeServer.inviteCode)
-                  setNotice(`Invite code ${activeServer.inviteCode} copied.`)
-                }}
-              >
-                Invite
-              </button>
-            </div>
-            <div className="channels">
-              <div className="section">
-                <span>Text channels</span>
-                <button onClick={() => setCreatingChannel('text')} title="Add text channel">
-                  +
-                </button>
-              </div>
-              {textChannels.map((channel) => (
-                <button
-                  key={channel.id}
-                  className={channel.id === activeChannelId ? 'channel active' : 'channel'}
-                  onClick={() => setActiveChannelId(channel.id)}
-                >
-                  <span className="icon">#</span>
-                  <span className="name">{channel.name}</span>
-                </button>
-              ))}
-              <div className="section">
-                <span>Voice channels</span>
-                <button onClick={() => setCreatingChannel('voice')} title="Add voice channel">
-                  +
-                </button>
-              </div>
-              {voiceChannels.map((channel) => (
-                <button
-                  key={channel.id}
-                  className={
-                    channel.id === voiceChannelId
-                      ? 'channel active'
-                      : channel.id === activeChannelId
-                        ? 'channel current'
-                        : 'channel'
-                  }
-                  onClick={() => void toggleVoice(channel)}
-                >
-                  <span className="icon">🔊</span>
-                  <span className="name">{channel.name}</span>
-                  {channel.id === voiceChannelId && <span className="live">live</span>}
-                </button>
-              ))}
-              {creatingChannel && (
-                <form className="channel-form" onSubmit={createChannel}>
-                  <input
-                    autoFocus
-                    value={newChannelName}
-                    onChange={(event) => setNewChannelName(event.target.value)}
-                    placeholder={
-                      creatingChannel === 'text' ? 'new-channel' : 'New voice room'
-                    }
-                    maxLength={40}
-                  />
-                  <div className="row">
-                    <button type="submit">Add</button>
-                    <button
-                      type="button"
-                      className="quiet"
-                      onClick={() => setCreatingChannel(null)}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </form>
-              )}
-            </div>
-            <div className="me">
-              <div className="avatar">{initials(session.user.name)}</div>
-              <div className="me-info">
-                <div className="name">{session.user.name}</div>
-                <div className="email">{session.user.email}</div>
-              </div>
-              <button className="quiet" onClick={onSignOut}>
-                Sign out
-              </button>
-            </div>
-          </>
-        ) : (
-          <div className="sidebar-empty">
-            <h2>No servers yet</h2>
-            <p>Create one, or join with an invite code.</p>
-            <form onSubmit={createServer}>
-              <input
+                autoFocus
                 value={newServerName}
                 onChange={(event) => setNewServerName(event.target.value)}
                 placeholder="Server name"
                 maxLength={60}
               />
-              <button type="submit">Create server</button>
+              <div className="row">
+                <button type="submit">Create</button>
+                <button type="button" className="quiet" onClick={() => setCreatingServer(false)}>
+                  Cancel
+                </button>
+              </div>
+              <form onSubmit={joinServer} className="join">
+                <input
+                  value={joinCode}
+                  onChange={(event) => setJoinCode(event.target.value)}
+                  placeholder="or paste an invite code"
+                />
+                <button type="submit" className="quiet">
+                  Join
+                </button>
+              </form>
             </form>
-            <form onSubmit={joinServer}>
-              <input
-                value={joinCode}
-                onChange={(event) => setJoinCode(event.target.value)}
-                placeholder="Invite code"
-              />
-              <button type="submit">Join</button>
-            </form>
-          </div>
-        )}
+          ) : activeServer ? (
+            <>
+              <div className="server-header">
+                <h2>{activeServer.name}</h2>
+                <button
+                  className="quiet"
+                  title="Invite code"
+                  onClick={() => {
+                    void navigator.clipboard?.writeText(activeServer.inviteCode)
+                    setNotice(`Invite code ${activeServer.inviteCode} copied.`)
+                  }}
+                >
+                  Invite
+                </button>
+              </div>
+              <div className="channels">
+                <div className="section">
+                  <span>Text channels</span>
+                  <button onClick={() => setCreatingChannel('text')} title="Add text channel">
+                    +
+                  </button>
+                </div>
+                {textChannels.map((channel) => (
+                  <button
+                    key={channel.id}
+                    className={
+                      view === 'chat' && channel.id === activeChannelId ? 'channel active' : 'channel'
+                    }
+                    onClick={() => selectChannel(channel)}
+                  >
+                    <span className="icon">#</span>
+                    <span className="name">{channel.name}</span>
+                  </button>
+                ))}
+                <div className="section">
+                  <span>Voice channels</span>
+                  <button onClick={() => setCreatingChannel('voice')} title="Add voice channel">
+                    +
+                  </button>
+                </div>
+                {voiceChannels.map((channel) => (
+                  <button
+                    key={channel.id}
+                    className={
+                      channel.id === voiceChannelId
+                        ? 'channel active'
+                        : view === 'chat' && channel.id === activeChannelId
+                          ? 'channel current'
+                          : 'channel'
+                    }
+                    onClick={() => selectChannel(channel)}
+                  >
+                    <span className="icon">🔊</span>
+                    <span className="name">{channel.name}</span>
+                    {channel.id === voiceChannelId && <span className="live">live</span>}
+                  </button>
+                ))}
+                {creatingChannel && (
+                  <form className="channel-form" onSubmit={createChannel}>
+                    <input
+                      autoFocus
+                      value={newChannelName}
+                      onChange={(event) => setNewChannelName(event.target.value)}
+                      placeholder={creatingChannel === 'text' ? 'new-channel' : 'New voice room'}
+                      maxLength={40}
+                    />
+                    <div className="row">
+                      <button type="submit">Add</button>
+                      <button
+                        type="button"
+                        className="quiet"
+                        onClick={() => setCreatingChannel(null)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                )}
+              </div>
+              <div className="me">
+                <div className="avatar">{initials(me.name)}</div>
+                <div className="me-info">
+                  <div className="name">{me.name}</div>
+                  <div className="email">{me.userId}</div>
+                </div>
+                <button className="quiet" onClick={onSignOut}>
+                  Sign out
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="sidebar-empty">
+              <h2>No servers yet</h2>
+              <p>Create one, or join with an invite code.</p>
+              <form onSubmit={createServer}>
+                <input
+                  value={newServerName}
+                  onChange={(event) => setNewServerName(event.target.value)}
+                  placeholder="Server name"
+                  maxLength={60}
+                />
+                <button type="submit">Create server</button>
+              </form>
+              <form onSubmit={joinServer}>
+                <input
+                  value={joinCode}
+                  onChange={(event) => setJoinCode(event.target.value)}
+                  placeholder="Invite code"
+                />
+                <button type="submit">Join</button>
+              </form>
+              <div className="me-inline">
+                <div className="avatar">{initials(me.name)}</div>
+                <div>
+                  <div className="name">{me.name}</div>
+                  <div className="email">{me.userId}</div>
+                </div>
+                <button className="quiet" onClick={onSignOut}>
+                  Sign out
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
+      {menuOpen && <button className="scrim" onClick={() => setMenuOpen(false)} aria-label="Close menu" />}
+
       <div className="main">
+        <div className="mobile-bar">
+          <button className="burger" onClick={() => setMenuOpen((open) => !open)} aria-label="Menu">
+            ☰
+          </button>
+          <span className="mobile-title">
+            {view === 'inbox' ? 'Direct messages' : view === 'admin' ? 'Admin' : activeChannel?.name ?? 'EncryDB'}
+          </span>
+        </div>
         {notice && (
           <button className="toast" onClick={() => setNotice('')} title="Dismiss">
             {notice}
           </button>
         )}
-        {activeChannel ? (
+
+        {view === 'inbox' ? (
+          <InboxView messages={inbox.messages} onOpen={openInboxMessage} />
+        ) : view === 'admin' && me.role === 'admin' ? (
+          <AdminView me={me} />
+        ) : activeChannel ? (
           <>
             <div className="chat-header">
               <span className="icon">{activeChannel.kind === 'voice' ? '🔊' : '#'}</span>
               <h2>{activeChannel.name}</h2>
-              <span className="count">
-                {activeServer?.members.length ?? 0} members
-              </span>
+              <span className="count">{activeServer?.members.length ?? 0} members</span>
             </div>
             {activeChannel.kind === 'voice' ? (
               <VoiceRoom
@@ -683,7 +1095,7 @@ function Workspace({
                 onMute={toggleMute}
                 onDeafen={toggleDeafen}
                 onLeave={() => void toggleVoice(activeChannel)}
-                meId={session.user.id}
+                meId={me.id}
               />
             ) : (
               <>
@@ -702,9 +1114,7 @@ function Workspace({
                     return (
                       <div key={message.id}>
                         {newDay && (
-                          <div className="message-date">
-                            {formatDay(message.createdAt)}
-                          </div>
+                          <div className="message-date">{formatDay(message.createdAt)}</div>
                         )}
                         <MessageRow message={message} />
                       </div>
@@ -866,11 +1276,12 @@ function App() {
       </div>
     )
 
-  if (!session?.user) return <AuthScreen onDone={() => void load()} />
+  if (!session?.user)
+    return <AuthScreen mailer={Boolean(session?.mailer)} onDone={() => void load()} />
 
   return (
     <Workspace
-      session={{ ...session, user: session.user }}
+      me={session.user}
       onSignOut={async () => {
         try {
           await post('/api/auth/signout')

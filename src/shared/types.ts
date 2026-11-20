@@ -1,7 +1,11 @@
+export type Role = 'admin' | 'member'
+
 export type User = {
   id: string
+  userId: string
   email: string
   name: string
+  role: Role
   createdAt: number
 }
 
@@ -48,6 +52,19 @@ export type ChatMessage = {
   createdAt: number
 }
 
+export type DmMessage = {
+  id: string
+  body: string
+  serverId: string | null
+  channelId: string | null
+  createdAt: number
+}
+
+export type Inbox = {
+  unread: number
+  messages: DmMessage[]
+}
+
 export type Peer = {
   peerId: string
   userId: string
@@ -63,7 +80,8 @@ export type Signal = {
 }
 
 export type SessionInfo = {
-  user: { id: string; name: string; email: string } | null
+  user: User | null
   mode: 'local' | 'freebuff' | 'setup'
   database: boolean
+  mailer: boolean
 }

@@ -7,11 +7,11 @@ import {
   clearedSessionCookie,
   currentUser,
   hashPassword,
-  isLocalPreview,
   sessionCookie,
   verifyPassword,
   type Env,
 } from './auth'
+import { sendVerificationEmail } from './mail'
 import {
   ensureSchema,
   mapChannel,
@@ -20,24 +20,48 @@ import {
   mapPeer,
   mapUser,
 } from './db'
-import type { Channel, Peer } from '../shared/types'
+import type { Channel, DmMessage } from '../shared/types'
 
-type Variables = { user: FreebuffUser; db: D1Database }
+type AccountRow = {
+  id: string
+  user_id: string | null
+  email: string
+  name: string
+  role: string
+  created_at: number
+}
+
+type Variables = { account: AccountRow; db: D1Database }
 type Authenticate = (request: Request, env: Env) => Promise<FreebuffUser | null>
 
 const SESSION_TTL = 30 * 24 * 60 * 60 * 1000
 const PEER_TIMEOUT = 20_000
 const MAX_IMAGE_CHARS = 900_000
+const CODE_TTL = 10 * 60 * 1000
 
 const uuid = () => crypto.randomUUID()
 const now = () => Date.now()
 
+const ID_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+
+function randomFrom(alphabet: string, length: number): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(length))
+  let out = ''
+  for (const byte of bytes) out += alphabet[byte % alphabet.length]
+  return out
+}
+
+/** Human-friendly login id, e.g. EDB-7K4M-9QX2. */
+function generateUserId(): string {
+  return `EDB-${randomFrom(ID_ALPHABET, 4)}-${randomFrom(ID_ALPHABET, 4)}`
+}
+
+function tempPassword(): string {
+  return randomFrom('abcdefghijkmnpqrstuvwxyz23456789', 12)
+}
+
 function inviteCode(): string {
-  const alphabet = 'abcdefghijkmnpqrstuvwxyz23456789'
-  const bytes = crypto.getRandomValues(new Uint8Array(8))
-  let code = ''
-  for (const byte of bytes) code += alphabet[byte % alphabet.length]
-  return code
+  return randomFrom('abcdefghijkmnpqrstuvwxyz23456789', 8)
 }
 
 function cleanChannelName(value: string): string | null {
@@ -50,25 +74,37 @@ function cleanChannelName(value: string): string | null {
   return name || null
 }
 
-/** Upsert the profile row for an identity (real accounts already have one). */
-async function ensureProfile(
-  db: D1Database,
-  sub: string,
-  fallbackName: string,
-): Promise<{ id: string; name: string; email: string }> {
-  const existing = await db
-    .prepare('SELECT id, name, email FROM users WHERE id = ?')
-    .bind(sub)
-    .first<{ id: string; name: string; email: string }>()
-  if (existing) return existing
-  const name = fallbackName.slice(0, 60) || 'Member'
+const EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/
+
+async function sha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(value),
+  )
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+const codeHash = (email: string, code: string) =>
+  sha256(`${email.toLowerCase()}:${code}`)
+
+/** Freebuff identities are provisioned on first sight; email accounts are real. */
+async function provision(db: D1Database, user: FreebuffUser): Promise<void> {
+  if (user.sub === 'local-preview') return
   await db
     .prepare(
-      'INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)',
+      `INSERT OR IGNORE INTO users (id, user_id, email, password_hash, name, role, created_at)
+       VALUES (?, ?, ?, 'none', ?, 'member', ?)`,
     )
-    .bind(sub, `${sub}@local.invalid`, 'none', name, now())
+    .bind(
+      user.sub,
+      generateUserId(),
+      `${user.sub}@freebuff.local`,
+      (user.name || user.email || 'Member').slice(0, 60),
+      now(),
+    )
     .run()
-  return { id: sub, name, email: `${sub}@local.invalid` }
 }
 
 async function membership(
@@ -92,6 +128,44 @@ async function membership(
   return { channel: mapChannel(row), serverId: row.server_id }
 }
 
+async function isAdmin(db: D1Database, userId: string): Promise<boolean> {
+  const row = await db
+    .prepare('SELECT role FROM users WHERE id = ?')
+    .bind(userId)
+    .first<{ role: string }>()
+  return row?.role === 'admin'
+}
+
+/** Append an announcement to a member's "Server" direct messages. */
+async function notify(
+  db: D1Database,
+  userId: string,
+  body: string,
+  serverId: string | null = null,
+  channelId: string | null = null,
+): Promise<void> {
+  const existing = await db
+    .prepare('SELECT id FROM dm_threads WHERE user_id = ?')
+    .bind(userId)
+    .first<{ id: string }>()
+  let threadId = existing?.id
+  if (!threadId) {
+    threadId = uuid()
+    await db
+      .prepare(
+        'INSERT INTO dm_threads (id, user_id, bot_name, last_read_at, created_at) VALUES (?, ?, ?, ?, ?)',
+      )
+      .bind(threadId, userId, 'Server', 0, now())
+      .run()
+  }
+  await db
+    .prepare(
+      'INSERT INTO dm_messages (id, thread_id, body, server_id, channel_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    )
+    .bind(uuid(), threadId, body, serverId, channelId, now())
+    .run()
+}
+
 export function createApp(authenticate: Authenticate = currentUser) {
   const app = new Hono<{ Bindings: Env; Variables: Variables }>()
 
@@ -105,7 +179,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
   app.use(
     '/api/*',
     bodyLimit({
-      maxSize: 32 * 1024,
+      maxSize: MAX_IMAGE_CHARS + 64 * 1024,
       onError: (c) => c.json({ error: 'Request is too large.' }, 413),
     }),
   )
@@ -115,82 +189,142 @@ export function createApp(authenticate: Authenticate = currentUser) {
     return c.json({ error: 'Something went wrong. Please try again.' }, 500)
   })
 
+  /* ---------------- session + account ---------------- */
+
   app.get('/api/session', async (c) => {
     const user = await authenticate(c.req.raw, c.env)
-    let profile: { id: string; name: string; email: string } | null = null
+    let account: AccountRow | null = null
     if (user && c.env.DB) {
       await ensureSchema(c.env.DB)
-      profile = await ensureProfile(
-        c.env.DB,
-        user.sub,
-        user.name || user.email || 'Member',
+      await provision(c.env.DB, user)
+      account = await c.env.DB.prepare(
+        'SELECT id, user_id, email, name, role, created_at FROM users WHERE id = ?',
       )
+        .bind(user.sub)
+        .first<AccountRow>()
     }
     return c.json({
-      user: profile,
-      mode: isLocalPreview(c.req.raw, c.env)
-        ? 'local'
-        : c.env.FREEBUFF_CLIENT_ID && c.env.APP_ORIGIN
-          ? 'freebuff'
-          : 'setup',
+      user: account ? mapUser(account) : null,
+      mode: c.env.FREEBUFF_CLIENT_ID && c.env.APP_ORIGIN ? 'freebuff' : 'local',
       database: Boolean(c.env.DB),
+      mailer: Boolean(c.env.RESEND_API_KEY),
     })
-  })
-
-  /** Every route below needs a signed-in identity and a database. */
-  app.use('/api/*', async (c, next) => {
-    if (c.req.path.startsWith('/api/auth/') || c.req.path === '/api/health')
-      return next()
-    const user = await authenticate(c.req.raw, c.env)
-    if (!user) return c.json({ error: 'Sign in required.' }, 401)
-    if (!c.env.DB)
-      return c.json(
-        { error: 'This app is still being set up. Please try again later.' },
-        503,
-      )
-    if (!['GET', 'HEAD'].includes(c.req.method)) {
-      const origin = appOrigin(c.req.raw, c.env)
-      if (!origin || !isSameOriginRequest(c.req.raw, origin))
-        return c.json({ error: 'Cross-origin request refused.' }, 403)
-    }
-    await ensureSchema(c.env.DB)
-    await ensureProfile(c.env.DB, user.sub, user.name || 'Member')
-    c.set('user', user)
-    c.set('db', c.env.DB)
-    await next()
   })
 
   /* ---------------- accounts ---------------- */
 
-  app.post('/api/auth/signup', async (c) => {
+  app.post('/api/auth/request-code', async (c) => {
     if (!c.env.DB) return c.json({ error: 'Database unavailable.' }, 503)
     const body = await c.req.json().catch(() => null)
-    if (!body || typeof body !== 'object')
-      return c.json({ error: 'Invalid request body.' }, 400)
-    const { email, password, name } = body as Record<string, unknown>
-    if (typeof email !== 'string' || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim()))
+    const raw = (body as Record<string, unknown> | null) || {}
+    const email = typeof raw.email === 'string' ? raw.email.trim().toLowerCase() : ''
+    const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, 60) : ''
+    if (!EMAIL.test(email))
       return c.json({ error: 'Enter a valid email address.' }, 400)
-    if (typeof password !== 'string' || password.length < 8)
-      return c.json({ error: 'Password must be at least 8 characters.' }, 400)
-    if (typeof name !== 'string' || !name.trim() || name.trim().length > 60)
-      return c.json({ error: 'Display name is required (max 60 characters).' }, 400)
     await ensureSchema(c.env.DB)
-    const lower = email.trim().toLowerCase()
     const taken = await c.env.DB.prepare('SELECT 1 FROM users WHERE email = ?')
-      .bind(lower)
+      .bind(email)
       .first()
     if (taken)
-      return c.json({ error: 'An account with that email already exists.' }, 409)
-    const id = uuid()
-    const hash = await hashPassword(password)
+      return c.json(
+        { error: 'That email already has an account. Sign in instead.' },
+        409,
+      )
+    const code = randomFrom('0123456789', 6)
+    const stamp = now()
     await c.env.DB.prepare(
-      'INSERT INTO users (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)',
+      `INSERT INTO pending_signups (email, name, code_hash, attempts, expires_at, created_at)
+       VALUES (?, ?, ?, 0, ?, ?)
+       ON CONFLICT(email) DO UPDATE SET
+         name = excluded.name,
+         code_hash = excluded.code_hash,
+         attempts = 0,
+         expires_at = excluded.expires_at,
+         created_at = excluded.created_at`,
     )
-      .bind(id, lower, hash, name.trim(), now())
+      .bind(email, name, await codeHash(email, code), stamp + CODE_TTL, stamp)
+      .run()
+    const delivery = await sendVerificationEmail(c.env, email, code)
+    return c.json({
+      delivery,
+      ...(delivery === 'preview' ? { code } : {}),
+      message:
+        delivery === 'email'
+          ? `We sent a six-digit code to ${email}.`
+          : 'Email delivery is not configured, so here is your code.',
+    })
+  })
+
+  app.post('/api/auth/verify', async (c) => {
+    if (!c.env.DB) return c.json({ error: 'Database unavailable.' }, 503)
+    const body = await c.req.json().catch(() => null)
+    const raw = (body as Record<string, unknown> | null) || {}
+    const email = typeof raw.email === 'string' ? raw.email.trim().toLowerCase() : ''
+    const code = typeof raw.code === 'string' ? raw.code.trim() : ''
+    const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, 60) : ''
+    const password = typeof raw.password === 'string' ? raw.password : ''
+    if (!EMAIL.test(email)) return c.json({ error: 'Enter a valid email address.' }, 400)
+    if (!/^\d{6}$/.test(code)) return c.json({ error: 'Enter the six-digit code.' }, 400)
+    if (!name) return c.json({ error: 'Choose a display name.' }, 400)
+    if (password.length < 8)
+      return c.json({ error: 'Password must be at least 8 characters.' }, 400)
+    await ensureSchema(c.env.DB)
+
+    const pending = await c.env.DB.prepare(
+      'SELECT code_hash, attempts, expires_at FROM pending_signups WHERE email = ?',
+    )
+      .bind(email)
+      .first<{ code_hash: string; attempts: number; expires_at: number }>()
+    if (!pending)
+      return c.json({ error: 'Request a code before verifying.' }, 400)
+    if (pending.expires_at < now()) {
+      await c.env.DB.prepare('DELETE FROM pending_signups WHERE email = ?')
+        .bind(email)
+        .run()
+      return c.json({ error: 'That code has expired. Request a new one.' }, 400)
+    }
+    if (pending.attempts >= 6)
+      return c.json(
+        { error: 'Too many attempts. Request a new code.' },
+        429,
+      )
+    if ((await codeHash(email, code)) !== pending.code_hash) {
+      await c.env.DB.prepare(
+        'UPDATE pending_signups SET attempts = attempts + 1 WHERE email = ?',
+      )
+        .bind(email)
+        .run()
+      return c.json({ error: 'That code is not right.' }, 400)
+    }
+    if (await c.env.DB.prepare('SELECT 1 FROM users WHERE email = ?').bind(email).first())
+      return c.json({ error: 'That email already has an account.' }, 409)
+
+    const total = await c.env.DB.prepare('SELECT COUNT(*) AS total FROM users')
+      .first<{ total: number }>()
+    const role = (total?.total ?? 0) === 0 ? 'admin' : 'member'
+    const id = uuid()
+    const userId = generateUserId()
+    const created = now()
+    await c.env.DB.prepare(
+      'INSERT INTO users (id, user_id, email, password_hash, name, role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    )
+      .bind(id, userId, email, await hashPassword(password), name, role, created)
+      .run()
+    await c.env.DB.prepare('DELETE FROM pending_signups WHERE email = ?')
+      .bind(email)
       .run()
     const sessionId = await createSession(c.env.DB, id)
     return c.json(
-      { user: { id, email: lower, name: name.trim() } },
+      {
+        user: {
+          id,
+          userId,
+          email,
+          name,
+          role,
+          createdAt: created,
+        },
+      },
       201,
       {
         'Set-Cookie': sessionCookie(
@@ -205,25 +339,22 @@ export function createApp(authenticate: Authenticate = currentUser) {
   app.post('/api/auth/signin', async (c) => {
     if (!c.env.DB) return c.json({ error: 'Database unavailable.' }, 503)
     const body = await c.req.json().catch(() => null)
-    if (!body || typeof body !== 'object')
-      return c.json({ error: 'Invalid request body.' }, 400)
-    const { email, password } = body as Record<string, unknown>
-    if (typeof email !== 'string' || typeof password !== 'string')
-      return c.json({ error: 'Email and password are required.' }, 400)
+    const raw = (body as Record<string, unknown> | null) || {}
+    const identifier =
+      typeof raw.identifier === 'string' ? raw.identifier.trim() : ''
+    const password = typeof raw.password === 'string' ? raw.password : ''
+    if (!identifier || !password)
+      return c.json({ error: 'Enter your user id and password.' }, 400)
     await ensureSchema(c.env.DB)
     const row = await c.env.DB.prepare(
-      'SELECT id, email, name, password_hash, created_at FROM users WHERE email = ?',
+      `SELECT id, user_id, email, name, role, password_hash, created_at
+         FROM users
+        WHERE lower(email) = lower(?) OR upper(user_id) = upper(?)`,
     )
-      .bind(email.trim().toLowerCase())
-      .first<{
-        id: string
-        email: string
-        name: string
-        password_hash: string
-        created_at: number
-      }>()
+      .bind(identifier, identifier)
+      .first<AccountRow & { password_hash: string }>()
     if (!row || !(await verifyPassword(password, row.password_hash)))
-      return c.json({ error: 'Incorrect email or password.' }, 401)
+      return c.json({ error: 'Wrong user id or password.' }, 401)
     const sessionId = await createSession(c.env.DB, row.id)
     return c.json(
       { user: mapUser(row) },
@@ -245,47 +376,134 @@ export function createApp(authenticate: Authenticate = currentUser) {
       await c.env.DB.prepare('DELETE FROM sessions WHERE id = ?')
         .bind(match[1])
         .run()
-    return c.json({ ok: true }, 200, {
-      'Set-Cookie': clearedSessionCookie(),
-    })
+    return c.json({ ok: true }, 200, { 'Set-Cookie': clearedSessionCookie() })
   })
 
-  app.get('/api/me', async (c) => {
-    const row = await c
-      .get('db')
-      .prepare('SELECT id, email, name, created_at FROM users WHERE id = ?')
-      .bind(c.get('user').sub)
-      .first<{ id: string; email: string; name: string; created_at: number }>()
-    return row
-      ? c.json({ user: mapUser(row) })
-      : c.json({ error: 'Account not found.' }, 404)
+  /* ---------------- everything below needs an account ---------------- */
+
+  app.use('/api/*', async (c, next) => {
+    if (
+      c.req.path.startsWith('/api/auth/') ||
+      c.req.path === '/api/health' ||
+      c.req.path === '/api/session'
+    )
+      return next()
+    const user = await authenticate(c.req.raw, c.env)
+    if (!user) return c.json({ error: 'Sign in required.' }, 401)
+    if (!c.env.DB)
+      return c.json(
+        { error: 'This app is still being set up. Please try again later.' },
+        503,
+      )
+    if (!['GET', 'HEAD'].includes(c.req.method)) {
+      const origin = appOrigin(c.req.raw, c.env)
+      if (!isSameOriginRequest(c.req.raw, origin))
+        return c.json({ error: 'Cross-origin request refused.' }, 403)
+    }
+    await ensureSchema(c.env.DB)
+    await provision(c.env.DB, user)
+    const account = await c.env.DB.prepare(
+      'SELECT id, user_id, email, name, role, created_at FROM users WHERE id = ?',
+    )
+      .bind(user.sub)
+      .first<AccountRow>()
+    if (!account) return c.json({ error: 'Sign in required.' }, 401)
+    c.set('account', account)
+    c.set('db', c.env.DB)
+    await next()
   })
+
+  app.get('/api/me', (c) => c.json({ user: mapUser(c.get('account')) }))
 
   app.patch('/api/me', async (c) => {
     const body = await c.req.json().catch(() => null)
-    if (!body || typeof body !== 'object')
-      return c.json({ error: 'Invalid request body.' }, 400)
-    const name = (body as Record<string, unknown>).name
+    const name = (body as Record<string, unknown> | null)?.name
     if (typeof name !== 'string' || !name.trim() || name.trim().length > 60)
       return c.json({ error: 'Name must be 1–60 characters.' }, 400)
     await c
       .get('db')
       .prepare('UPDATE users SET name = ? WHERE id = ?')
-      .bind(name.trim(), c.get('user').sub)
+      .bind(name.trim(), c.get('account').id)
       .run()
     return c.json({ ok: true, name: name.trim() })
+  })
+
+  /* ---------------- admin ---------------- */
+
+  app.get('/api/admin/users', async (c) => {
+    if (!(await isAdmin(c.get('db'), c.get('account').id)))
+      return c.json({ error: 'Admins only.' }, 403)
+    const rows = await c
+      .get('db')
+      .prepare(
+        'SELECT id, user_id, email, name, role, created_at FROM users ORDER BY created_at ASC',
+      )
+      .all<AccountRow>()
+    return c.json({ users: rows.results.map(mapUser) })
+  })
+
+  app.post('/api/admin/users', async (c) => {
+    const db = c.get('db')
+    if (!(await isAdmin(db, c.get('account').id)))
+      return c.json({ error: 'Admins only.' }, 403)
+    const body = await c.req.json().catch(() => null)
+    const raw = (body as Record<string, unknown> | null) || {}
+    const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, 60) : ''
+    const email =
+      typeof raw.email === 'string' ? raw.email.trim().toLowerCase() : ''
+    if (!name) return c.json({ error: 'A display name is required.' }, 400)
+    if (email && !EMAIL.test(email))
+      return c.json({ error: 'Enter a valid email address.' }, 400)
+    if (email) {
+      const taken = await db.prepare('SELECT 1 FROM users WHERE email = ?')
+        .bind(email)
+        .first()
+      if (taken) return c.json({ error: 'That email is already registered.' }, 409)
+    }
+    const id = uuid()
+    const userId = generateUserId()
+    const password = tempPassword()
+    const createdAt = now()
+    await db
+      .prepare(
+        'INSERT INTO users (id, user_id, email, password_hash, name, role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .bind(
+        id,
+        userId,
+        email || `${userId.toLowerCase()}@users.encrydb.local`,
+        await hashPassword(password),
+        name,
+        'member',
+        createdAt,
+      )
+      .run()
+    return c.json(
+      {
+        user: {
+          id,
+          userId,
+          email,
+          name,
+          role: 'member',
+          createdAt,
+        },
+        password,
+      },
+      201,
+    )
   })
 
   /* ---------------- servers ---------------- */
 
   app.get('/api/servers', async (c) => {
     const db = c.get('db')
-    const userId = c.get('user').sub
+    const account = c.get('account')
     const rows = await db
       .prepare(
         'SELECT s.id, s.name, s.owner_id, s.invite_code, m.role FROM servers s JOIN server_members m ON m.server_id = s.id WHERE m.user_id = ? ORDER BY s.created_at ASC',
       )
-      .bind(userId)
+      .bind(account.id)
       .all<{
         id: string
         name: string
@@ -332,7 +550,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
     if (typeof name !== 'string' || !name.trim() || name.trim().length > 60)
       return c.json({ error: 'Server name is required (max 60 characters).' }, 400)
     const db = c.get('db')
-    const userId = c.get('user').sub
+    const account = c.get('account')
     const id = uuid()
     const code = inviteCode()
     const created = now()
@@ -340,13 +558,13 @@ export function createApp(authenticate: Authenticate = currentUser) {
       .prepare(
         'INSERT INTO servers (id, name, owner_id, invite_code, created_at) VALUES (?, ?, ?, ?, ?)',
       )
-      .bind(id, name.trim(), userId, code, created)
+      .bind(id, name.trim(), account.id, code, created)
       .run()
     await db
       .prepare(
         'INSERT INTO server_members (server_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)',
       )
-      .bind(id, userId, 'owner', created)
+      .bind(id, account.id, 'owner', created)
       .run()
     const general = uuid()
     const voice = uuid()
@@ -367,16 +585,14 @@ export function createApp(authenticate: Authenticate = currentUser) {
         server: {
           id,
           name: name.trim(),
-          ownerId: userId,
+          ownerId: account.id,
           role: 'owner',
           inviteCode: code,
           channels: [
             { id: general, serverId: id, name: 'general', kind: 'text', position: 0 },
             { id: voice, serverId: id, name: 'Voice', kind: 'voice', position: 1 },
           ],
-          members: [
-            { userId, name: c.get('user').name || 'You', role: 'owner' },
-          ],
+          members: [{ userId: account.id, name: account.name, role: 'owner' }],
         },
       },
       201,
@@ -389,18 +605,25 @@ export function createApp(authenticate: Authenticate = currentUser) {
     if (typeof code !== 'string' || !code.trim())
       return c.json({ error: 'An invite code is required.' }, 400)
     const db = c.get('db')
-    const userId = c.get('user').sub
+    const account = c.get('account')
     const server = await db
       .prepare('SELECT id, name FROM servers WHERE invite_code = ?')
       .bind(code.trim().toLowerCase())
       .first<{ id: string; name: string }>()
     if (!server) return c.json({ error: 'That invite code is not valid.' }, 404)
-    await db
+    const added = await db
       .prepare(
         'INSERT OR IGNORE INTO server_members (server_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)',
       )
-      .bind(server.id, userId, 'member', now())
+      .bind(server.id, account.id, 'member', now())
       .run()
+    if (added.meta.changes)
+      await notify(
+        db,
+        account.id,
+        `You were added to ${server.name}. Open it from the left to join the conversation.`,
+        server.id,
+      )
     return c.json({ ok: true, serverId: server.id, name: server.name })
   })
 
@@ -414,7 +637,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
     const db = c.get('db')
     const member = await db
       .prepare('SELECT 1 FROM server_members WHERE server_id = ? AND user_id = ?')
-      .bind(serverId, c.get('user').sub)
+      .bind(serverId, c.get('account').id)
       .first()
     if (!member) return c.json({ error: 'Access denied.' }, 403)
     const count = await db
@@ -438,20 +661,59 @@ export function createApp(authenticate: Authenticate = currentUser) {
 
   app.post('/api/servers/:id/leave', async (c) => {
     const db = c.get('db')
-    const userId = c.get('user').sub
+    const account = c.get('account')
     const serverId = c.req.param('id')
     const owner = await db
       .prepare('SELECT owner_id FROM servers WHERE id = ?')
       .bind(serverId)
       .first<{ owner_id: string }>()
-    if (owner?.owner_id === userId)
-      return c.json(
-        { error: 'You own this server, so it cannot be left.' },
-        400,
-      )
+    if (owner?.owner_id === account.id)
+      return c.json({ error: 'You own this server, so it cannot be left.' }, 400)
     await db
       .prepare('DELETE FROM server_members WHERE server_id = ? AND user_id = ?')
-      .bind(serverId, userId)
+      .bind(serverId, account.id)
+      .run()
+    return c.json({ ok: true })
+  })
+
+  /* ---------------- direct messages from Server ---------------- */
+
+  app.get('/api/dm', async (c) => {
+    const db = c.get('db')
+    const account = c.get('account')
+    const thread = await db
+      .prepare('SELECT id, last_read_at FROM dm_threads WHERE user_id = ?')
+      .bind(account.id)
+      .first<{ id: string; last_read_at: number }>()
+    if (!thread) return c.json({ unread: 0, messages: [] })
+    const rows = await db
+      .prepare(
+        'SELECT id, body, server_id, channel_id, created_at FROM dm_messages WHERE thread_id = ? ORDER BY created_at ASC LIMIT 100',
+      )
+      .bind(thread.id)
+      .all<{
+        id: string
+        body: string
+        server_id: string | null
+        channel_id: string | null
+        created_at: number
+      }>()
+    const messages: DmMessage[] = rows.results.map((row) => ({
+      id: row.id,
+      body: row.body,
+      serverId: row.server_id,
+      channelId: row.channel_id,
+      createdAt: row.created_at,
+    }))
+    const unread = messages.filter((m) => m.createdAt > thread.last_read_at).length
+    return c.json({ unread, messages })
+  })
+
+  app.post('/api/dm/read', async (c) => {
+    await c
+      .get('db')
+      .prepare('UPDATE dm_threads SET last_read_at = ? WHERE user_id = ?')
+      .bind(now(), c.get('account').id)
       .run()
     return c.json({ ok: true })
   })
@@ -460,7 +722,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
 
   app.get('/api/channels/:id/messages', async (c) => {
     const db = c.get('db')
-    const found = await membership(db, c.req.param('id'), c.get('user').sub)
+    const found = await membership(db, c.req.param('id'), c.get('account').id)
     if (!found) return c.json({ error: 'Access denied.' }, 404)
     const after = Number(c.req.query('after') || 0)
     const rows = await db
@@ -479,92 +741,85 @@ export function createApp(authenticate: Authenticate = currentUser) {
     return c.json({ messages: rows.results.map(mapMessage) })
   })
 
-  app.post(
-    '/api/channels/:id/messages',
-    bodyLimit({
-      maxSize: MAX_IMAGE_CHARS + 32 * 1024,
-      onError: (c) => c.json({ error: 'That image is too large.' }, 413),
-    }),
-    async (c) => {
-      const db = c.get('db')
-      const userId = c.get('user').sub
-      const found = await membership(db, c.req.param('id'), userId)
-      if (!found) return c.json({ error: 'Access denied.' }, 404)
-      if (found.channel.kind !== 'text')
-        return c.json({ error: 'Voice channels do not take messages.' }, 400)
-      const body = await c.req.json().catch(() => null)
-      if (!body || typeof body !== 'object')
-        return c.json({ error: 'Invalid request body.' }, 400)
-      const raw = body as Record<string, unknown>
-      const content = typeof raw.content === 'string' ? raw.content.trim() : ''
-      const image = raw.image as
-        | { name?: unknown; mime?: unknown; dataUrl?: unknown }
-        | undefined
-      if (!content && !image)
-        return c.json({ error: 'Write a message or attach an image.' }, 400)
-      if (content.length > 2000)
-        return c.json({ error: 'Messages are limited to 2000 characters.' }, 400)
+  app.post('/api/channels/:id/messages', async (c) => {
+    const db = c.get('db')
+    const account = c.get('account')
+    const found = await membership(db, c.req.param('id'), account.id)
+    if (!found) return c.json({ error: 'Access denied.' }, 404)
+    if (found.channel.kind !== 'text')
+      return c.json({ error: 'Voice channels do not take messages.' }, 400)
+    const body = await c.req.json().catch(() => null)
+    if (!body || typeof body !== 'object')
+      return c.json({ error: 'Invalid request body.' }, 400)
+    const raw = body as Record<string, unknown>
+    const content = typeof raw.content === 'string' ? raw.content.trim() : ''
+    const image = raw.image as
+      | { name?: unknown; mime?: unknown; dataUrl?: unknown }
+      | undefined
+    if (!content && !image)
+      return c.json({ error: 'Write a message or attach an image.' }, 400)
+    if (content.length > 2000)
+      return c.json({ error: 'Messages are limited to 2000 characters.' }, 400)
 
-      let fileId: string | null = null
-      if (image) {
-        const dataUrl = typeof image.dataUrl === 'string' ? image.dataUrl : ''
-        const name = typeof image.name === 'string' ? image.name : 'image'
-        const mime = typeof image.mime === 'string' ? image.mime : 'image/png'
-        const match = /^data:([^;]+);base64,(.+)$/.exec(dataUrl)
-        if (!match || !mime.startsWith('image/'))
-          return c.json({ error: 'Attach a valid image file.' }, 400)
-        if (match[2].length > MAX_IMAGE_CHARS)
-          return c.json({ error: 'That image is too large (max ~650 KB).' }, 413)
-        fileId = uuid()
-        await db
-          .prepare(
-            'INSERT INTO files (id, owner_id, filename, mime, size, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          )
-          .bind(
-            fileId,
-            userId,
-            name.slice(0, 120),
-            mime,
-            Math.floor((match[2].length * 3) / 4),
-            match[2],
-            now(),
-          )
-          .run()
-      }
-
-      const id = uuid()
-      const created = now()
+    let fileId: string | null = null
+    if (image) {
+      const dataUrl = typeof image.dataUrl === 'string' ? image.dataUrl : ''
+      const name = typeof image.name === 'string' ? image.name : 'image'
+      const mime = typeof image.mime === 'string' ? image.mime : 'image/png'
+      const match = /^data:([^;]+);base64,(.+)$/.exec(dataUrl)
+      if (!match || !mime.startsWith('image/'))
+        return c.json({ error: 'Attach a valid image file.' }, 400)
+      if (match[2].length > MAX_IMAGE_CHARS)
+        return c.json({ error: 'That image is too large (max ~650 KB).' }, 413)
+      fileId = uuid()
       await db
         .prepare(
-          'INSERT INTO messages (id, channel_id, author_id, content, kind, file_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO files (id, owner_id, filename, mime, size, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
         )
         .bind(
-          id,
-          found.channel.id,
-          userId,
-          content,
-          fileId ? 'image' : 'text',
           fileId,
-          created,
+          account.id,
+          name.slice(0, 120),
+          mime,
+          Math.floor((match[2].length * 3) / 4),
+          match[2],
+          now(),
         )
         .run()
-      const saved = await db
-        .prepare(
-          `SELECT m.id, m.channel_id, m.author_id, m.content, m.kind, m.file_id, m.created_at,
-                  u.name AS author_name, f.filename
-             FROM messages m JOIN users u ON u.id = m.author_id
-             LEFT JOIN files f ON f.id = m.file_id
-            WHERE m.id = ?`,
-        )
-        .bind(id)
-        .first<Parameters<typeof mapMessage>[0]>()
-      return c.json({ message: saved ? mapMessage(saved) : null }, 201)
-    },
-  )
+    }
+
+    const id = uuid()
+    const created = now()
+    await db
+      .prepare(
+        'INSERT INTO messages (id, channel_id, author_id, content, kind, file_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .bind(
+        id,
+        found.channel.id,
+        account.id,
+        content,
+        fileId ? 'image' : 'text',
+        fileId,
+        created,
+      )
+      .run()
+    const saved = await db
+      .prepare(
+        `SELECT m.id, m.channel_id, m.author_id, m.content, m.kind, m.file_id, m.created_at,
+                u.name AS author_name, f.filename
+           FROM messages m JOIN users u ON u.id = m.author_id
+           LEFT JOIN files f ON f.id = m.file_id
+          WHERE m.id = ?`,
+      )
+      .bind(id)
+      .first<Parameters<typeof mapMessage>[0]>()
+    return c.json({ message: saved ? mapMessage(saved) : null }, 201)
+  })
 
   app.get('/api/files/:id', async (c) => {
-    const db = c.get('db')
-    const row = await db
+    const row = await c
+      .get('db')
       .prepare('SELECT id, mime, data FROM files WHERE id = ?')
       .bind(c.req.param('id'))
       .first<{ id: string; mime: string; data: string }>()
@@ -585,44 +840,71 @@ export function createApp(authenticate: Authenticate = currentUser) {
 
   app.post('/api/channels/:id/voice/join', async (c) => {
     const db = c.get('db')
-    const userId = c.get('user').sub
-    const found = await membership(db, c.req.param('id'), userId)
+    const account = c.get('account')
+    const found = await membership(db, c.req.param('id'), account.id)
     if (!found) return c.json({ error: 'Access denied.' }, 404)
     if (found.channel.kind !== 'voice')
       return c.json({ error: 'That is not a voice channel.' }, 400)
     const body = await c.req.json().catch(() => null)
-    const muted =
-      (body as Record<string, unknown> | null)?.muted === true ? 1 : 0
-    const profile = await db
-      .prepare('SELECT name FROM users WHERE id = ?')
-      .bind(userId)
-      .first<{ name: string }>()
-    const peerId = uuid()
+    const muted = (body as Record<string, unknown> | null)?.muted === true ? 1 : 0
     const stamp = now()
+    const peerId = uuid()
     await db
       .prepare(
         'INSERT INTO voice_peers (id, channel_id, user_id, name, muted, last_seen) VALUES (?, ?, ?, ?, ?, ?)',
       )
-      .bind(peerId, found.channel.id, userId, profile?.name || 'Member', muted, stamp)
+      .bind(peerId, found.channel.id, account.id, account.name, muted, stamp)
       .run()
+
+    // Announce a new meeting once, to everyone in the server but the host.
+    const others = await db
+      .prepare(
+        'SELECT COUNT(*) AS total FROM voice_peers WHERE channel_id = ? AND id <> ? AND last_seen >= ?',
+      )
+      .bind(found.channel.id, peerId, stamp - PEER_TIMEOUT)
+      .first<{ total: number }>()
+    if ((others?.total ?? 0) === 0) {
+      const recent = await db
+        .prepare(
+          'SELECT 1 FROM dm_messages WHERE channel_id = ? AND created_at > ? LIMIT 1',
+        )
+        .bind(found.channel.id, stamp - 15 * 60 * 1000)
+        .first()
+      if (!recent) {
+        const server = await db
+          .prepare('SELECT name FROM servers WHERE id = ?')
+          .bind(found.serverId)
+          .first<{ name: string }>()
+        const audience = await db
+          .prepare('SELECT user_id FROM server_members WHERE server_id = ? AND user_id <> ?')
+          .bind(found.serverId, account.id)
+          .all<{ user_id: string }>()
+        for (const member of audience.results)
+          await notify(
+            db,
+            member.user_id,
+            `Meeting started in ${server?.name ?? 'a server'} · #${found.channel.name}. Open the channel to join the call.`,
+            found.serverId,
+            found.channel.id,
+          )
+      }
+    }
     return c.json({ peerId, channel: found.channel })
   })
 
   app.post('/api/channels/:id/voice/heartbeat', async (c) => {
     const db = c.get('db')
-    const found = await membership(db, c.req.param('id'), c.get('user').sub)
+    const found = await membership(db, c.req.param('id'), c.get('account').id)
     if (!found) return c.json({ error: 'Access denied.' }, 404)
     const body = await c.req.json().catch(() => null)
-    const peerId = (body as Record<string, unknown> | null)?.peerId
-    const muted =
-      (body as Record<string, unknown> | null)?.muted === true ? 1 : 0
+    const raw = (body as Record<string, unknown> | null) || {}
+    const peerId = raw.peerId
+    const muted = raw.muted === true ? 1 : 0
     if (typeof peerId !== 'string')
       return c.json({ error: 'A peer id is required.' }, 400)
     const stamp = now()
     await db
-      .prepare(
-        'UPDATE voice_peers SET last_seen = ?, muted = ? WHERE id = ? AND channel_id = ?',
-      )
+      .prepare('UPDATE voice_peers SET last_seen = ?, muted = ? WHERE id = ? AND channel_id = ?')
       .bind(stamp, muted, peerId, found.channel.id)
       .run()
     await db
@@ -644,7 +926,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
 
   app.post('/api/channels/:id/voice/signal', async (c) => {
     const db = c.get('db')
-    const found = await membership(db, c.req.param('id'), c.get('user').sub)
+    const found = await membership(db, c.req.param('id'), c.get('account').id)
     if (!found) return c.json({ error: 'Access denied.' }, 404)
     const body = await c.req.json().catch(() => null)
     const raw = (body as Record<string, unknown> | null) || {}
@@ -669,7 +951,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
 
   app.get('/api/channels/:id/voice/signals', async (c) => {
     const db = c.get('db')
-    const found = await membership(db, c.req.param('id'), c.get('user').sub)
+    const found = await membership(db, c.req.param('id'), c.get('account').id)
     if (!found) return c.json({ error: 'Access denied.' }, 404)
     const peerId = c.req.query('peerId') || ''
     const after = Number(c.req.query('after') || 0)
@@ -691,15 +973,19 @@ export function createApp(authenticate: Authenticate = currentUser) {
 
   app.post('/api/channels/:id/voice/leave', async (c) => {
     const db = c.get('db')
-    const found = await membership(db, c.req.param('id'), c.get('user').sub)
+    const found = await membership(db, c.req.param('id'), c.get('account').id)
     if (!found) return c.json({ error: 'Access denied.' }, 404)
     const body = await c.req.json().catch(() => null)
     const peerId = (body as Record<string, unknown> | null)?.peerId
     if (typeof peerId === 'string') {
-      await db.prepare('DELETE FROM voice_peers WHERE id = ? AND channel_id = ?')
+      await db
+        .prepare('DELETE FROM voice_peers WHERE id = ? AND channel_id = ?')
         .bind(peerId, found.channel.id)
         .run()
-      await db.prepare('DELETE FROM voice_signals WHERE channel_id = ? AND (from_peer = ? OR to_peer = ?)')
+      await db
+        .prepare(
+          'DELETE FROM voice_signals WHERE channel_id = ? AND (from_peer = ? OR to_peer = ?)',
+        )
         .bind(found.channel.id, peerId, peerId)
         .run()
     }

@@ -11,9 +11,11 @@ import type {
 export const SCHEMA: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
+    user_id TEXT,
     email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     name TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'member',
     created_at INTEGER NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS sessions (
@@ -23,6 +25,14 @@ export const SCHEMA: readonly string[] = [
     expires_at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id)`,
+  `CREATE TABLE IF NOT EXISTS pending_signups (
+    email TEXT PRIMARY KEY,
+    name TEXT,
+    code_hash TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS servers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -65,6 +75,22 @@ export const SCHEMA: readonly string[] = [
     created_at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS messages_channel ON messages(channel_id, created_at, id)`,
+  `CREATE TABLE IF NOT EXISTS dm_threads (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL UNIQUE,
+    bot_name TEXT NOT NULL DEFAULT 'Server',
+    last_read_at INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS dm_messages (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    server_id TEXT,
+    channel_id TEXT,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS dm_messages_thread ON dm_messages(thread_id, created_at)`,
   `CREATE TABLE IF NOT EXISTS voice_peers (
     id TEXT PRIMARY KEY,
     channel_id TEXT NOT NULL,
@@ -87,20 +113,60 @@ export const SCHEMA: readonly string[] = [
 ]
 
 let ready: Promise<void> | undefined
+
+/** Create tables, then add columns that older databases are missing. */
 export function ensureSchema(db: D1Database): Promise<void> {
   if (!ready) {
-    ready = db
-      .batch(SCHEMA.map((sql) => db.prepare(sql)))
-      .then(() => undefined)
-      .catch((error) => {
-        ready = undefined
-        throw error
-      })
+    ready = (async () => {
+      await db.batch(SCHEMA.map((sql) => db.prepare(sql)))
+      await addColumn(db, 'users', 'user_id', 'TEXT')
+      await addColumn(db, 'users', 'role', `TEXT NOT NULL DEFAULT 'member'`)
+      // Give legacy accounts an id and make sure somebody can administer.
+      await db
+        .prepare(
+          "UPDATE users SET user_id = 'EDB-' || upper(substr(replace(id, '-', ''), 1, 8)) WHERE user_id IS NULL",
+        )
+        .run()
+      const admin = await db
+        .prepare("SELECT 1 FROM users WHERE role = 'admin' LIMIT 1")
+        .first()
+      if (!admin) {
+        const first = await db
+          .prepare('SELECT id FROM users ORDER BY created_at ASC LIMIT 1')
+          .first<{ id: string }>()
+        if (first)
+          await db
+            .prepare("UPDATE users SET role = 'admin' WHERE id = ?")
+            .bind(first.id)
+            .run()
+      }
+    })().catch((error) => {
+      ready = undefined
+      throw error
+    })
   }
   return ready
 }
 
-type UserRow = { id: string; email: string; name: string; created_at: number }
+async function addColumn(
+  db: D1Database,
+  table: string,
+  column: string,
+  definition: string,
+) {
+  const info = await db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>()
+  if (!info.results.some((row) => row.name === column))
+    await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run()
+}
+
+type UserRow = {
+  id: string
+  user_id: string | null
+  email: string
+  name: string
+  role: string
+  created_at: number
+}
 type ServerRow = { id: string; name: string; owner_id: string; invite_code: string }
 type ChannelRow = {
   id: string
@@ -112,8 +178,10 @@ type ChannelRow = {
 
 export const mapUser = (row: UserRow): User => ({
   id: row.id,
+  userId: row.user_id || row.id,
   email: row.email,
   name: row.name,
+  role: row.role === 'admin' ? 'admin' : 'member',
   createdAt: row.created_at,
 })
 

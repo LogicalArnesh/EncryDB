@@ -69,10 +69,27 @@ function cookieOf(response: Response): string {
   return header.split(';')[0] ?? ''
 }
 
-async function signUp(email: string, name: string): Promise<string> {
-  const response = await call('/api/auth/signup', {
+async function requestCode(email: string, name: string): Promise<string> {
+  const response = await call('/api/auth/request-code', {
     method: 'POST',
-    body: { email, password: 'password-123', name },
+    body: { email, name },
+  })
+  expect(response.status).toBe(200)
+  const data = (await response.json()) as { code?: string; delivery: string }
+  expect(data.delivery).toBe('preview')
+  if (!data.code) throw new Error('expected a preview code')
+  return data.code
+}
+
+async function signUp(
+  email: string,
+  name: string,
+  password = 'password-123',
+): Promise<string> {
+  const code = await requestCode(email, name)
+  const response = await call('/api/auth/verify', {
+    method: 'POST',
+    body: { email, code, name, password },
   })
   expect(response.status).toBe(201)
   return cookieOf(response)
@@ -85,14 +102,18 @@ test('signed out requests are refused but public assets stay public', async () =
   expect((await call('/api/health')).status).toBe(200)
 })
 
-test('accounts can register, sign in, sign out and update a profile', async () => {
-  const signup = await call('/api/auth/signup', {
+test('email verification issues a user id that can sign in and out', async () => {
+  const code = await requestCode('ada@example.com', 'Ada')
+  const verified = await call('/api/auth/verify', {
     method: 'POST',
-    body: { email: 'ada@example.com', password: 'password-123', name: 'Ada' },
+    body: { email: 'ada@example.com', code, name: 'Ada', password: 'password-123' },
   })
-  expect(signup.status).toBe(201)
-  const cookie = cookieOf(signup)
+  expect(verified.status).toBe(201)
+  const cookie = cookieOf(verified)
   expect(cookie).toContain('encrydb_session=')
+  const created = (await verified.json()) as { user: { userId: string; role: string } }
+  expect(created.user.userId).toMatch(/^EDB-[A-Z2-9]{4}-[A-Z2-9]{4}$/)
+  expect(created.user.role).toBe('admin')
 
   const me = await call('/api/me', { cookie })
   expect(me.status).toBe(200)
@@ -105,38 +126,160 @@ test('accounts can register, sign in, sign out and update a profile', async () =
   })
   expect(renamed.status).toBe(200)
 
-  const duplicate = await call('/api/auth/signup', {
-    method: 'POST',
-    body: { email: 'ADA@example.com', password: 'password-123', name: 'Dup' },
-  })
-  expect(duplicate.status).toBe(409)
+  // The same code cannot be replayed, and the email cannot sign up twice.
+  expect(
+    (await call('/api/auth/verify', {
+      method: 'POST',
+      body: { email: 'ada@example.com', code, name: 'Ada', password: 'password-123' },
+    })).status,
+  ).toBe(400)
+  expect(
+    (await call('/api/auth/request-code', {
+      method: 'POST',
+      body: { email: 'ADA@example.com', name: 'Dup' },
+    })).status,
+  ).toBe(409)
 
   const wrong = await call('/api/auth/signin', {
     method: 'POST',
-    body: { email: 'ada@example.com', password: 'not-the-password' },
+    body: { identifier: created.user.userId, password: 'not-the-password' },
   })
   expect(wrong.status).toBe(401)
 
   const good = await call('/api/auth/signin', {
     method: 'POST',
-    body: { email: 'ada@example.com', password: 'password-123' },
+    body: { identifier: created.user.userId, password: 'password-123' },
   })
   expect(good.status).toBe(200)
+
+  // Email works as the identifier too.
+  expect(
+    (await call('/api/auth/signin', {
+      method: 'POST',
+      body: { identifier: 'ada@example.com', password: 'password-123' },
+    })).status,
+  ).toBe(200)
 
   const signout = await call('/api/auth/signout', { method: 'POST', cookie })
   expect(signout.status).toBe(200)
   expect((await call('/api/me', { cookie })).status).toBe(401)
 })
 
-test('rejects weak or malformed registration input', async () => {
-  for (const body of [
-    { email: 'not-an-email', password: 'password-123', name: 'X' },
-    { email: 'a@b.co', password: 'short', name: 'X' },
-    { email: 'a@b.co', password: 'password-123', name: '' },
-    {},
-  ]) {
-    expect((await call('/api/auth/signup', { method: 'POST', body })).status).toBe(400)
+test('rejects malformed signup input and wrong codes', async () => {
+  expect(
+    (await call('/api/auth/request-code', {
+      method: 'POST',
+      body: { email: 'not-an-email', name: 'X' },
+    })).status,
+  ).toBe(400)
+  const code = await requestCode('check@example.com', 'Check')
+  const wrong = code === '000000' ? '111111' : '000000'
+  expect(
+    (await call('/api/auth/verify', {
+      method: 'POST',
+      body: { email: 'check@example.com', code: wrong, name: 'Check', password: 'password-123' },
+    })).status,
+  ).toBe(400)
+  expect(
+    (await call('/api/auth/verify', {
+      method: 'POST',
+      body: { email: 'check@example.com', code, name: '', password: 'password-123' },
+    })).status,
+  ).toBe(400)
+  expect(
+    (await call('/api/auth/verify', {
+      method: 'POST',
+      body: { email: 'check@example.com', code, name: 'Check', password: 'short' },
+    })).status,
+  ).toBe(400)
+  expect(
+    (await call('/api/auth/verify', {
+      method: 'POST',
+      body: { email: 'check@example.com', code, name: 'Check', password: 'password-123' },
+    })).status,
+  ).toBe(201)
+})
+
+test('admins issue ids, server inbox announces meetings, servers stay private', async () => {
+  // The very first account of a fresh database becomes the workspace admin.
+  const adminLogin = await call('/api/auth/signin', {
+    method: 'POST',
+    body: { identifier: 'ada@example.com', password: 'password-123' },
+  })
+  expect(adminLogin.status).toBe(200)
+  const admin = cookieOf(adminLogin)
+  const session = (await (await call('/api/session', { cookie: admin })).json()) as {
+    user: { role: string }
   }
+  expect(session.user.role).toBe('admin')
+
+  // A fresh account sees no servers until invited.
+  const newcomer = await signUp('new@example.com', 'New Person')
+  const empty = (await (await call('/api/servers', { cookie: newcomer })).json()) as {
+    servers: unknown[]
+  }
+  expect(empty.servers).toHaveLength(0)
+
+  // Admin creates an id and hands over the generated credentials.
+  const issued = await call('/api/admin/users', {
+    method: 'POST',
+    cookie: admin,
+    body: { name: 'Grace' },
+  })
+  expect(issued.status).toBe(201)
+  const issuedBody = (await issued.json()) as {
+    user: { userId: string }
+    password: string
+  }
+  const issuedLogin = await call('/api/auth/signin', {
+    method: 'POST',
+    body: { identifier: issuedBody.user.userId, password: issuedBody.password },
+  })
+  expect(issuedLogin.status).toBe(200)
+  const grace = cookieOf(issuedLogin)
+  expect(
+    (await call('/api/admin/users', { method: 'POST', cookie: grace, body: { name: 'Nope' } }))
+      .status,
+  ).toBe(403)
+
+  const created = await call('/api/servers', {
+    method: 'POST',
+    cookie: admin,
+    body: { name: 'Meetings' },
+  })
+  const server = (await created.json()) as {
+    server: { id: string; inviteCode: string; channels: { id: string; kind: string }[] }
+  }
+  const voice = server.server.channels.find((channel) => channel.kind === 'voice')!
+
+  await call('/api/servers/join', {
+    method: 'POST',
+    cookie: grace,
+    body: { code: server.server.inviteCode },
+  })
+  const joinedInbox = (await (
+    await call('/api/dm', { cookie: grace })
+  ).json()) as { unread: number; messages: { body: string }[] }
+  expect(joinedInbox.messages[0].body).toContain('You were added to Meetings')
+
+  await call('/api/channels/' + voice.id + '/voice/join', {
+    method: 'POST',
+    cookie: admin,
+  })
+  const meetingInbox = (await (
+    await call('/api/dm', { cookie: grace })
+  ).json()) as {
+    unread: number
+    messages: { body: string; channelId: string | null }[]
+  }
+  const notice = meetingInbox.messages.find((message) => message.body.includes('Meeting started'))
+  expect(notice?.body).toContain('Meetings')
+  expect(notice?.channelId).toBe(voice.id)
+  expect(meetingInbox.unread).toBeGreaterThan(0)
+
+  await call('/api/dm/read', { method: 'POST', cookie: grace })
+  const read = (await (await call('/api/dm', { cookie: grace })).json()) as { unread: number }
+  expect(read.unread).toBe(0)
 })
 
 test('servers, channels, invites and messages work end to end', async () => {

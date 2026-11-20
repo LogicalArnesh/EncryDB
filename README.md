@@ -1,73 +1,99 @@
 # EncryDB
 
-A Discord-style chat app for the browser: servers, text channels, image sharing
-and real group voice calls over WebRTC. Runs as a single Cloudflare Worker plus
-a React SPA, backed by D1.
+A Discord-style workspace for teams: servers, text and voice channels, image
+sharing, direct messages from `Server`, and email-verified accounts with
+generated user ids.
 
-## What works
+Runs as a single Cloudflare Worker (Hono + React) with D1 for storage, so there
+is one deployable unit and one database.
 
-- **Accounts** — email + password registration and sign-in. Passwords are hashed
-  with PBKDF2-SHA256 (150k rounds, per-user salt); sessions are HTTP-only cookies
-  stored in the database, so signing out really revokes them.
-- **Servers and channels** — create servers (each starts with `#general` and a
-  `Voice` room), add text or voice channels, invite people with an 8-character
-  code, leave servers you do not own.
-- **Text chat** — message history (last 200, polled every 2.5s for new messages),
-  Enter to send, Shift+Enter for a newline, day separators, per-server member list.
-- **Images** — attach an image up to ~600 KB; it is stored in D1 and served from
-  the same origin through `GET /api/files/:id`.
-- **Group voice** — join a voice channel and everyone in it is connected peer to
-  peer (WebRTC with DTLS-SRTP encryption). The Worker only relays SDP/ICE
-  signalling and presence; audio never passes through the server. Mute, deafen
-  and leave are in the call bar.
+## Accounts
 
-## Run it
+1. **Request a code** with your email. A six-digit code is generated and stored
+   hashed for ten minutes.
+2. **Verify** the code with a display name and password. The account is created
+   and a user id is generated, e.g. `EDB-7K4M-9QX2`.
+3. **Sign in** with either that user id or the email address, plus the password.
 
-```sh
+The first account created on an empty database becomes the workspace **admin**.
+Admins get an Admin screen where they can issue ids for other people: enter a
+name (email optional) and the app returns a fresh user id and a one-time
+temporary password to hand over.
+
+### Email delivery
+
+A Cloudflare Worker cannot open an SMTP connection, so a Gmail "app password"
+cannot be used directly. The app sends through an HTTP email API instead:
+
+```
+RESEND_API_KEY=...            # API key from resend.com
+MAIL_FROM="EncryDB <no-reply@yourdomain.com>"   # optional, needs a verified domain
+```
+
+Until `RESEND_API_KEY` is set, the code is shown on screen after requesting it
+(the signup says "mail delivery not set up"). That keeps preview builds usable;
+set the key to send real mail. Any HTTP mail provider can be wired in
+`src/worker/mail.ts` — it is one `fetch` call.
+
+## Servers and privacy
+
+Servers are only ever returned to their own members: `/api/servers` joins
+through `server_members`, and every channel, message, file and voice endpoint
+checks membership first. A new account sees an empty sidebar until it joins with
+an invite code.
+
+## Direct messages from Server
+
+`Server` is a bot identity. It writes to each member's direct messages when:
+
+- they are added to a server, and
+- a meeting starts in one of their servers (once per channel per 15 minutes).
+
+The bell in the rail shows an unread badge; opening the inbox marks it read.
+Meeting notices carry an **Open channel** button that jumps straight to the
+voice room.
+
+## Voice
+
+WebRTC mesh over DTLS-SRTP, audio peer-to-peer. Signalling and presence are
+relayed through the Worker using `voice_peers` and `voice_signals` in D1, so no
+Durable Object or separate server is needed. The offerer is chosen
+deterministically (lower peer id) to avoid glare. There is no TURN server yet,
+so restrictive NATs can fail to connect.
+
+## Layout
+
+- **Laptop / desktop** — server rail, channel sidebar, chat, member list.
+- **Phone / tablet** — the rail and sidebar become a slide-in drawer behind the
+  hamburger button; the member list is hidden; the composer stays pinned.
+
+## Develop
+
+```bash
 bun install
-bun run dev        # http://localhost:3000 — local D1 via the Cloudflare Vite plugin
-bun test           # API tests against a real local D1 (Miniflare)
+bun run dev      # http://localhost:3000
+bun test         # API tests against a real local D1
 bun run typecheck
 bun run build
 ```
 
-On `localhost` with no Freebuff auth configuration the app uses a single local
-preview identity, so `bun run dev` is usable immediately. Register an account to
-get a real per-user session.
-
-## Layout
-
-| Path | What it holds |
-| --- | --- |
-| `src/worker/app.ts` | Hono API: accounts, servers, messages, files, voice signalling |
-| `src/worker/auth.ts` | session cookies, PBKDF2 hashing, Freebuff sign-in wrapper, local preview identity |
-| `src/worker/db.ts` | D1 schema and row mappers |
-| `src/client/main.tsx` | the whole interface: rail, channel list, chat, voice room, members |
-| `src/client/voice.ts` | WebRTC mesh + HTTP signalling loop |
-| `src/client/api.ts` | fetch helpers, formatting |
-| `src/shared/types.ts` | types shared by client and worker |
-| `tests/app.test.ts` | end-to-end API tests |
+`bun run dev` uses a local D1 database in `.wrangler/state`. Delete that folder
+to start from an empty workspace (the next account created becomes admin).
 
 ## Deploy
 
-Provisioned as a Freebuff Sites project with a D1 database bound as `DB`.
-`bun run build` emits the Worker bundle and assets; deploy that output. Sites
-injects `FREEBUFF_CLIENT_ID`, `FREEBUFF_ISSUER` and `APP_ORIGIN` when Sign in with
-Freebuff is enabled; email/password accounts work without them.
+The Worker is deployed with `deploy.json` → `dist/encrydb/index.js` plus
+`dist/client`. Add the `DB` D1 binding and `RESEND_API_KEY` as a secret in the
+hosting environment.
 
-## Limits and next steps
+## Security notes
 
-- **Not end-to-end encrypted yet.** The original EncryDB design was zero
-  knowledge; this build stores message text in D1 so history and search work
-  across devices. Transport is TLS and voice is DTLS-SRTP encrypted, but the
-  server can read text messages. Adding per-server AES-GCM keys held only by
-  members (shared through invite links) is the next step, and the message model
-  is already shaped for it: only `content` would need encrypting.
-- Voice uses a peer-to-peer mesh, which is comfortable up to ~6 people; larger
-  rooms need an SFU.
-- Signalling and history are polled over HTTP (1.2s for voice, 2.5s for chat).
-  Sites realtime (Durable Objects) would make both push-based.
-- Images are capped at ~600 KB and stored in D1; R2 is the right home once volume
-  grows.
-- No TURN server is configured, so voice between strict NATs may fail; add TURN
-  credentials to `ICE` in `src/client/voice.ts` for production reliability.
+- Passwords: PBKDF2-SHA256, 150k rounds, per-user salt.
+- Sessions: random 128-bit ids in the `sessions` table, HTTP-only `SameSite=Lax`
+  cookies, revoked on sign-out.
+- Verification codes: stored as SHA-256 hashes, ten-minute expiry, six attempts.
+- All mutations check `Origin` against the request origin (CSRF).
+- **Message contents are not end-to-end encrypted yet.** They are stored in D1
+  as plain text and the server can read them; transport is TLS. Per-server
+  AES-GCM keys shared over invite links is the next step.
+- Images are capped at ~600 KB and stored in D1; R2 is the better home long term.
