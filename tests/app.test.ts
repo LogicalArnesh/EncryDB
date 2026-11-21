@@ -46,6 +46,7 @@ type Options = {
   body?: unknown
   cookie?: string
   origin?: string
+  env?: Env
 }
 
 async function call(path: string, options: Options = {}) {
@@ -60,7 +61,7 @@ async function call(path: string, options: Options = {}) {
       },
       ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
     },
-    env,
+    options.env ?? env,
   )
 }
 
@@ -488,6 +489,40 @@ test('voice peers exchange signals and leave cleanly', async () => {
     })
   ).json()) as { peers: { peerId: string }[] }
   expect(after.peers.map((peer) => peer.peerId)).not.toContain(second.peerId)
+})
+
+test('a configured mailer that fails never shows the code', async () => {
+  const broken = createApp(undefined, () => {
+    throw new Error('connect() failed')
+  })
+  const smtpEnv = {
+    ...env,
+    MAIL_USER: 'me@gmail.com',
+    MAIL_APP_PASSWORD: 'abcdefghijklmnop',
+  }
+  const response = await broken.request(
+    `${ORIGIN}/api/auth/request-code`,
+    {
+      method: 'POST',
+      headers: { Origin: ORIGIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'mailto@example.com', name: 'Mail' }),
+    },
+    smtpEnv,
+  )
+  expect(response.status).toBe(502)
+  const body = (await response.json()) as { error: string; code?: string }
+  expect(body.code).toBeUndefined()
+  expect(body.error).toContain('could not send')
+
+  // The same request with no mail transport still reports preview mode.
+  const preview = (await (
+    await call('/api/auth/request-code', {
+      method: 'POST',
+      body: { email: 'mailto2@example.com', name: 'Mail' },
+    })
+  ).json()) as { delivery: string; code?: string }
+  expect(preview.delivery).toBe('preview')
+  expect(preview.code).toMatch(/^\d{6}$/)
 })
 
 test('cross-origin mutations are refused', async () => {

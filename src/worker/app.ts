@@ -11,7 +11,8 @@ import {
   verifyPassword,
   type Env,
 } from './auth'
-import { sendVerificationEmail } from './mail'
+import { MailDeliveryError, mailTransport, sendVerificationEmail } from './mail'
+import type { ConnectFn } from './smtp'
 import {
   ensureSchema,
   mapChannel,
@@ -166,7 +167,10 @@ async function notify(
     .run()
 }
 
-export function createApp(authenticate: Authenticate = currentUser) {
+export function createApp(
+  authenticate: Authenticate = currentUser,
+  smtpConnect?: ConnectFn,
+) {
   const app = new Hono<{ Bindings: Env; Variables: Variables }>()
 
   app.get('/api/health', (c) => c.json({ ok: true }))
@@ -207,7 +211,8 @@ export function createApp(authenticate: Authenticate = currentUser) {
       user: account ? mapUser(account) : null,
       mode: c.env.FREEBUFF_CLIENT_ID && c.env.APP_ORIGIN ? 'freebuff' : 'local',
       database: Boolean(c.env.DB),
-      mailer: Boolean(c.env.RESEND_API_KEY),
+      mailer: mailTransport(c.env) !== 'none',
+      mailTransport: mailTransport(c.env),
     })
   })
 
@@ -244,7 +249,24 @@ export function createApp(authenticate: Authenticate = currentUser) {
     )
       .bind(email, name, await codeHash(email, code), stamp + CODE_TTL, stamp)
       .run()
-    const delivery = await sendVerificationEmail(c.env, email, code)
+    let delivery: 'email' | 'preview'
+    try {
+      delivery = await sendVerificationEmail(c.env, email, code, smtpConnect)
+    } catch (error) {
+      // Never fall back to showing the code: an unconfigured preview build is
+      // the only case where the client may see it.
+      const detail = error instanceof Error ? error.message : 'unknown error'
+      console.error('verification email failed', detail)
+      return c.json(
+        {
+          error:
+            error instanceof MailDeliveryError && error.detail
+              ? `We could not send the verification email (${error.detail}).`
+              : 'We could not send the verification email. Please try again.',
+        },
+        502,
+      )
+    }
     return c.json({
       delivery,
       ...(delivery === 'preview' ? { code } : {}),

@@ -9,6 +9,14 @@ export type Env = {
   APP_ORIGIN?: string
   RESEND_API_KEY?: string
   MAIL_FROM?: string
+  /** Mailbox that sends the verification codes, e.g. me@gmail.com */
+  MAIL_USER?: string
+  /** App password for that mailbox (Gmail: Account → Security → App passwords). */
+  MAIL_APP_PASSWORD?: string
+  /** SMTP submission host, defaults to smtp.gmail.com */
+  SMTP_HOST?: string
+  /** 465 (implicit TLS, default) or 587 (STARTTLS). */
+  SMTP_PORT?: string
 }
 
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]'])

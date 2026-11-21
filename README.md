@@ -22,18 +22,30 @@ temporary password to hand over.
 
 ### Email delivery
 
-A Cloudflare Worker cannot open an SMTP connection, so a Gmail "app password"
-cannot be used directly. The app sends through an HTTP email API instead:
+Codes are sent by SMTP straight from the Worker, so a normal mailbox app
+password works — no email API needed. Workers cannot reach port 25, but they can
+open a TLS connection to a submission server on 465/587, which is all SMTP needs
+(`src/worker/smtp.ts` is a small dependency-free client for exactly that).
+
+Set these as secrets in the hosting environment:
 
 ```
-RESEND_API_KEY=...            # API key from resend.com
-MAIL_FROM="EncryDB <no-reply@yourdomain.com>"   # optional, needs a verified domain
+MAIL_USER=you@gmail.com          # mailbox that sends the codes
+MAIL_APP_PASSWORD=xxxxxxxxxxxxxxxx   # 16-character app password
+SMTP_HOST=smtp.gmail.com         # optional, this is the default
+SMTP_PORT=465                    # optional: 465 implicit TLS (default), 587 STARTTLS
+MAIL_FROM="EncryDB <you@gmail.com>"  # optional From header; defaults to MAIL_USER
 ```
 
-Until `RESEND_API_KEY` is set, the code is shown on screen after requesting it
-(the signup says "mail delivery not set up"). That keeps preview builds usable;
-set the key to send real mail. Any HTTP mail provider can be wired in
-`src/worker/mail.ts` — it is one `fetch` call.
+For Gmail/Workspace: turn on 2-Step Verification, then create an app password at
+<https://myaccount.google.com/apppasswords> and use that 16-character value
+(spaces are fine). Google rejects normal account passwords over SMTP.
+
+`RESEND_API_KEY` (plus `MAIL_FROM`) still works as an HTTP fallback when
+`MAIL_USER`/`MAIL_APP_PASSWORD` are unset. Only when **no** transport is
+configured does the app return the code to the client, which keeps a preview
+build usable; a configured transport that fails returns a 502 and never leaks
+the code.
 
 ## Servers and privacy
 
@@ -83,7 +95,8 @@ to start from an empty workspace (the next account created becomes admin).
 ## Deploy
 
 The Worker is deployed with `deploy.json` → `dist/encrydb/index.js` plus
-`dist/client`. Add the `DB` D1 binding and `RESEND_API_KEY` as a secret in the
+`dist/client`. Add the `DB` D1 binding and the mail secrets (`MAIL_USER`,
+`MAIL_APP_PASSWORD`, optionally `SMTP_HOST`/`SMTP_PORT`/`MAIL_FROM`) in the
 hosting environment.
 
 ## Security notes

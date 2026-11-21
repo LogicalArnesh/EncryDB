@@ -1,7 +1,12 @@
+import { connect } from 'cloudflare:sockets'
 import { createApp } from './app'
+import type { ConnectFn } from './smtp'
 import { getAuth, type Env } from './auth'
 
-const app = createApp()
+// The mailer receives connect() rather than importing it, so the SMTP client
+// stays testable outside the Workers runtime. workers-types marks the socket
+// streams nullable; sendSmtpMail only touches them after `opened` resolves.
+const app = createApp(undefined, connect as unknown as ConnectFn)
 
 export default {
   async fetch(
